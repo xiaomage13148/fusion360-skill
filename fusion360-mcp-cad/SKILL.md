@@ -44,7 +44,7 @@ description: 通过 Fusion360 MCP 服务进行参数化实体 CAD 建模：强�
 每个特征严格走固定闭环：
 
 1. 先查 API 文档（`fusion_mcp_read` + `queryType: "apiDocumentation"`），再用 `fusion_mcp_execute` + script 创建**单个**特征；
-2. 单独调用一次脚本，读取实体尺寸并 `print` 输出（包围盒、体积、关键尺寸）；
+2. 单独调用一次脚本（**设 `readOnly: true`**），读取实体尺寸并 `print` 输出（包围盒、体积、关键尺寸）；
 3. 调用 `fusion_mcp_read` + `queryType: "screenshot"` + `direction: "iso-top-left"` 捕获正交等轴测视图（截图前关闭基准面、草图标记，画面只保留实体）；
 4. 分析「测量数值 + 截图图像」，输出自检报告；
 5. 输出自检结论，等待用户确认后才允许进入下一个特征；用户不确认，禁止继续。
@@ -64,6 +64,7 @@ description: 通过 Fusion360 MCP 服务进行参数化实体 CAD 建模：强�
 - 采样温度固定 0.1~0.2（模型/客户端可配置时），保持工具调用稳定、可复现，禁止高随机性。
 - 编写任何建模脚本前，先用 `fusion_mcp_read` + `queryType: "apiDocumentation"` 查清目标 API（类、方法、属性、枚举），禁止凭记忆手写 `adsk.fusion` 调用。
 - 脚本内不要用 try/except 捕获异常，让报错信息完整暴露，便于诊断与回退。
+- 测量/检查脚本一律设 `readOnly: true`（命令对话框打开时也可运行）；建模脚本不设该参数——若用户正处于草图/拉伸等命令中，先请其关闭对话框再执行。
 - 禁止在同一次工具调用中混合规划、建模、截图、测量多个任务。
 - 单轮对话最多 1 张截图，避免图片膨胀上下文；零件完成后建议新开对话，隔离历史图片与 MCP 日志。
 - 开始建模前先确认 Fusion360 MCP 服务在线（端点 `http://127.0.0.1:27182/mcp`），可用 `scripts/check_mcp_server.py` 探测连通性。
@@ -84,7 +85,7 @@ description: 通过 Fusion360 MCP 服务进行参数化实体 CAD 建模：强�
 
 ## 失败与异常处理
 
-出错时先分类再修复，禁止盲目重试整套流程。常见错误（草图未约束、圆角超限、布尔失败、MCP 掉线）的诊断与修复策略见 `references/error-recovery.md`。
+出错时先分类再修复，禁止盲目重试整套流程。常见错误（草图未约束、圆角超限、布尔失败、命令对话框阻塞、脚本 API 误用、MCP 掉线）的诊断与修复策略见 `references/error-recovery.md`。
 
 ## 资源索引
 

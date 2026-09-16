@@ -66,13 +66,24 @@
 
 ### 8. 建模脚本执行异常（Python / API 错误）
 
-- **现象**：`fusion_mcp_execute` 返回 traceback：`NameError`、`AttributeError`、`TypeError`、`RuntimeError`，或提示找不到 `run` 函数。
-- **根因**：凭记忆写 API（名称/签名错误）；对象类型未 `cast` 转换；枚举值拼写错误；脚本缺少 `def run(_context: str):` 入口。
+- **现象**：`fusion_mcp_execute` 返回 traceback：`NameError`、`AttributeError`、`TypeError`、`RuntimeError`，或提示找不到 `run` 函数；也可能是 `Cannot modify the design from a read-only context`。
+- **根因**：凭记忆写 API（名称/签名错误）；对象类型未 `cast` 转换；枚举值拼写错误；脚本缺少 `def run(_context: str):` 入口；误给会修改设计的脚本设了 `readOnly: true`。
 - **修复**：
   1. 用 `fusion_mcp_read` + `queryType: "apiDocumentation"` 查询正确 API（`apiCategory: "class"` 定位类，`"member"` 查方法与枚举）；
   2. 按查询结果修正脚本，改名、改参数、补 `cast`；
-  3. 若失败发生在特征创建中途，先 `fusion_mcp_update` + `undo` 回退，再执行修正后的脚本。
-- **预防**：任何建模脚本都先查 API 文档；入口函数签名严格保持 `def run(_context: str):`；不捕获异常。
+  3. 只读越权时：去掉 `readOnly`，或把脚本改成真正只读（不创建/修改/删除任何内容）；
+  4. 若失败发生在特征创建中途，先 `fusion_mcp_update` + `undo` 回退，再执行修正后的脚本。
+- **预防**：任何建模脚本都先查 API 文档；入口函数签名严格保持 `def run(_context: str):`；不捕获异常；`readOnly` 只给纯检查脚本使用。
+
+### 9. 命令对话框打开导致脚本被拒（Command dialog open）
+
+- **现象**：`fusion_mcp_execute` 返回错误，提示命令/对话框正在进行中，脚本无法执行。
+- **根因**：用户正处于草图、拉伸等交互命令中。普通脚本**不允许**在命令对话框打开时运行（Fusion 更新后引入的限制）。
+- **修复**：
+  1. 脚本只做检查/测量 → 加 `readOnly: true` 重发，只读脚本允许在对话框打开时运行；
+  2. 脚本需要修改设计 → 请用户先完成或关闭当前命令对话框，再重新执行；
+  3. 可用 `fusion_mcp_read` + `queryType: "activeCommand"` 查看用户当前命令状态（含各输入值），据此决定等待还是继续。
+- **预防**：把所有测量脚本写成只读（`readOnly: true`）；发起建模前先用 `activeCommand` 确认没有命令在进行。
 
 ## 诊断输出模板
 

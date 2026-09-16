@@ -23,7 +23,7 @@
 
 ## 适配器版本与 Schema 核对（重要）
 
-`fusion360-mcp-cad/references/mcp-tools.md` 中记录的是 **MCP Server Adapter 1.0.0** 的实际工具定义：
+`fusion360-mcp-cad/references/mcp-tools.md` 中记录的是 **MCP Server Adapter 1.0.0** 的实际工具定义（最近核对：2026-09-16，Fusion 360 更新后重新拉取）：
 
 - 端点：`http://127.0.0.1:27182/mcp`
 - 工具：`fusion_mcp_read`、`fusion_mcp_execute`、`fusion_mcp_update`、`fusion_mcp_electronics_read`
@@ -42,10 +42,12 @@ python fusion360-mcp-cad/scripts/check_mcp_server.py --tools --json
 **核对要点**：
 
 1. 工具名称与数量（当前为 4 个）；
-2. `fusion_mcp_read` 的 `queryType` 枚举（`apiDocumentation` / `screenshot` / `document` / `projects` / `activeCommand`）；
-3. `fusion_mcp_execute` 的 `featureType` 枚举与脚本入口约定（`def run(_context: str):`、`print` 作为输出、不捕获异常）；
+2. `fusion_mcp_read` 的 `queryType` 枚举（当前：`apiDocumentation` / `licensing` / `screenshot` / `document` / `projects` / `activeCommand`）；
+3. `fusion_mcp_execute` 的 `featureType` 枚举（当前：`script` / `document` / `purchase` / `editImage` / `generatePowerpoint` / `previewImage`）与脚本约定（`def run(_context: str):`、`print` 作为输出、不捕获异常、只读脚本用 `readOnly: true`）；
 4. `screenshot` 查询的 `direction` 枚举（校验用 `iso-top-left`）与 `width` / `height` 取值范围（32–4096）；
 5. `fusion_mcp_update` 的 `featureType`（`undo` / `redo`）。
+
+> 注意：`serverInfo` 版本号可能不变，但工具定义已经扩展（例如 2026-09 的 Fusion 360 更新新增了 `readOnly`、`licensing` 与多个 `featureType`）。**核对时以 schema 内容为准，不要只看版本号。**
 
 发现差异时：同步更新 `fusion360-mcp-cad/references/mcp-tools.md` 及受影响的 `SKILL.md` / references 文件，然后重新打包 zip（保持 `fusion360-mcp-cad/SKILL.md` 的目录结构）。
 
@@ -57,7 +59,7 @@ fusion360-mcp-cad/
 ├── references/
 │   ├── mcp-tools.md               MCP 真实工具定义、参数约定与推荐调用序列
 │   ├── visual-verification.md     视觉校验清单、自检报告模板、无视觉降级方案
-│   ├── error-recovery.md          8 类错误分类与修复策略
+│   ├── error-recovery.md          9 类错误分类与修复策略
 │   └── 3d-print-rules.md          3D 打印专项规则（壁厚/支撑/拔模/公差/凸雕文字）
 └── scripts/
     ├── check_mcp_server.py        探测 MCP 端点，列出工具、参数与完整 schema

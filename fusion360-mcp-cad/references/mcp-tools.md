@@ -1,8 +1,8 @@
 # Fusion360 MCP 工具参考
 
-> 本文件基于对**实际运行中的 MCP 服务**调用 `tools/list` 返回的真实定义整理。
+> 本文件基于对**实际运行中的 MCP 服务**调用 `tools/list` 返回的真实定义整理（最近核对：2026-09-16，Fusion 360 更新后重新拉取）。
 > 服务信息：`http://127.0.0.1:27182/mcp`，serverInfo = **MCP Server Adapter 1.0.0**。
-> 适配器升级后工具可能变化。用 `scripts/check_mcp_server.py --tools --detail` 查看概览，或用 `--tools --json` 获取完整 schema 后核对本文件。
+> 服务升级后工具与参数可能变化（注意：serverInfo 版本号可能不变但定义已扩展）。用 `scripts/check_mcp_server.py --tools --detail` 查看概览，或用 `--tools --json` 获取完整 schema 后核对本文件。
 
 ## 服务配置
 
@@ -38,6 +38,7 @@
 | queryType | 用途 | 主要附加参数 | 返回 |
 |---|---|---|---|
 | `apiDocumentation` | 查询 Fusion API 类 / 成员文档 | `searchPattern`（正则）、`apiCategory`、`filter` | classes（含成员概览）、members（完整描述） |
+| `licensing` | 查询当前用户的许可与权益状态 | 无 | 许可摘要、服务、已激活/可购买扩展、Flex 令牌余额 |
 | `screenshot` | 捕获活动视口 PNG | `direction`、`width`、`height`、`antiAliasing`、`transparentBackground` | `{"type":"image","mimeType":"image/png","base64Data":"..."}` |
 | `document` | 文档查询 | `operation`：`search`/`open`/`recent`，`name`，`project` | results 列表（名称、id 与状态字段） |
 | `projects` | 列出当前 hub 全部项目 | 无 | projects 列表（name、id） |
@@ -72,6 +73,14 @@
 - `isDefaultCommand: true` 表示当前是会话默认命令（无交互对话框）。
 - 用途：在交互式命令进行中读取用户当前参数状态，避免与用户手工操作冲突。
 
+### licensing（许可与权益，Fusion 更新后新增）
+
+- 无参数，返回 `{success, queryType:"licensing", licenseTypeSummary, summary, services, activeExtensions, purchasableExtensions, flexTokens}`。
+- `summary` 含许可类型判定标志：`isHobbyist`（个人版）、`isStudent`（教育版）、`isCommercial`（商业版）。
+- `activeExtensions`：用户已拥有的扩展（不要建议再次购买或重复启用）；`purchasableExtensions`：商业用户可购买、教育用户可免费启用的扩展。
+- `flexTokens`：Flex 令牌余额、账户、`isFlexAvailable`、`isTFlexContract` 等字段。
+- 用途：涉及许可、购买、扩展能力咨询时先查此项；本 skill 的几何建模流程通常不需要。
+
 > 注：`searchPattern` 的字段描述中提到了 `materialLibraries` 查询，但该值未出现在 `queryType` 枚举中。以服务实际响应为准。
 
 ## 2. fusion_mcp_execute（执行）
@@ -87,6 +96,13 @@
 }
 ```
 
+`object` 参数：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `script` | 是 | Python 脚本源码 |
+| `readOnly` | 否 | `true` 表示脚本只读，默认 `false` |
+
 服务端强制要求：
 
 - 脚本必须定义入口函数 `def run(_context: str):`，执行时被调用。
@@ -95,6 +111,16 @@
 - **不要用 try/except 捕获异常**：异常信息是判断失败原因的关键，捕获后无法定位问题。
 - 建议流程：先查 API 文档 → 写脚本 → 执行 → 用读取/截图确认结果。
 
+返回结构（实测）：`result.content[0].text` 为 JSON 字符串，`message` 字段承载脚本 `print()` 的全部输出（如 `"bodies=0\ntimeline features=0\n"`），`success` 标识执行是否成功——**测量结果从 `message` 中读取**。
+
+**readOnly 规则（Fusion 更新后新增，对校验闭环很关键）**：
+
+- 普通脚本**不能**在命令对话框打开时运行（例如用户正处于草图或拉伸命令中），会直接返回错误。
+- 纯检查、纯测量的脚本应设 `readOnly: true`：这类脚本**允许在命令对话框打开时运行**，是命令进行中读取模型状态的唯一方式。
+- 该声明会被**强制执行**：只读脚本一旦尝试修改设计，立即报错 `Cannot modify the design from a read-only context`。
+- 只读脚本还必须避免 `Application.executeTextCommand`（不受该机制覆盖）。
+- 需要修改设计时：省略 `readOnly`，并先请用户关闭当前对话框。
+
 ### featureType = "document"
 
 | operation | 必填参数 | 说明 |
@@ -102,6 +128,24 @@
 | `open` | `object.fileId` | 打开文档；fileId 由 read 的 `document` 查询（`search`）获得 |
 | `close` | `userConfirmedSaveAndClose` **或** `userConfirmedCloseWithoutSave` | 有未保存改动时必须先征询用户，二选一 |
 | `save` | 无 | **除用户明确要求保存外，不要调用** |
+
+### 其他 featureType（非建模用途，Fusion 更新后新增）
+
+以下能力与本 skill 的实体建模流程无关，仅在用户明确提出对应需求时使用；**不得用于替代几何校验**。
+
+| featureType | 用途 | 必填 object 字段 |
+|---|---|---|
+| `purchase` | 打开应用内 Purchase Manager（订阅、席位、扩展、Flex 令牌） | `purchaseInterest`（`fusion_subscription`/`extension`/`flex`）、`userConfirmedOpenPurchaseManager`（**必须用户明确同意后**才设 true） |
+| `editImage` | 用自然语言提示编辑模型截图（换材质、放入场景渲染） | `image_url`（签名 URL）、`s3_url`、`prompt`（**逐字传递用户提示，不要改写**） |
+| `generatePowerpoint` | 按 JSON 定义生成 PPT | `slides_json`；**调用前必须先读 `resource://mcp.generate_powerpoint_schema` 并向用户确认大纲** |
+| `previewImage` | 预览 / 打开 / 下载生成的文件（图片、pptx） | `image_url`、`s3_url`（单文件传字符串，多文件传等长数组）；`action`：`preview`/`external`/`download` |
+
+要点：
+
+- `purchase`：调用前先查 `licensing`；不同许可类型（个人 / 教育 / 商业）的可用选项与话术不同，教育用户不得使用 `fusion_subscription` 与 `flex`。
+- `editImage`：每次消耗一次 AI 媒体生成配额；返回结构化 attachments，不要把原始 JSON 展示给用户。
+- `previewImage`：多文件时仅支持 `action: "download"`。
+- 建模与校验流程中默认不调用以上 4 种。
 
 ## 3. fusion_mcp_update（撤销 / 重做）
 
@@ -116,8 +160,8 @@
 
 仅在存在活动 Electronics 文档时可用，用于读取原理图 / PCB / 库数据。
 
-- `entity_type`（必填）：`electronics.<Class>`，共 49 种，覆盖：
-  - 原理图类：`Schematic`、`Sheet`、`Net`、`Bus`、`Wire`、`Segment`、`Junction`、`Label`、`Part`、`Instance`、`Gate`、`Pin`、`PinRef`、`Port`、`PortRef`、`Module`、`ModuleInstance`、`Symbol`、`Variant`、`VariantDef`、`Technology`
+- `entity_type`（必填）：`electronics.<Class>`，共 50 种（Fusion 更新后新增 `PortNetMappingEntry`），覆盖：
+  - 原理图类：`Schematic`、`Sheet`、`Net`、`Bus`、`Wire`、`Segment`、`Junction`、`Label`、`Part`、`Instance`、`Gate`、`Pin`、`PinRef`、`Port`、`PortRef`、`PortNetMappingEntry`、`Module`、`ModuleInstance`、`Symbol`、`Variant`、`VariantDef`、`Technology`
   - PCB 类：`Board`、`Signal`、`Layer`、`Pad`、`Smd`、`Via`、`Hole`、`PolyPour`、`PolyShape`、`PolyCutout`、`Spline`、`Dimension`、`Element`、`Error`、`NetClass`、`Package`、`Package3D`、`Contact`、`ContactRef`
   - 通用类：`Attribute`、`Library`、`Device`、`DeviceSet`、`Frame`、`Grid`、`Circle`、`Rectangle`、`Text`
 - `object`（可选）：
@@ -136,7 +180,8 @@
 2) 建特征     fusion_mcp_execute { "featureType": "script",
                                    "object": { "script": "<只创建 1 个特征的脚本>" } }
 3) 读尺寸     fusion_mcp_execute { "featureType": "script",
-                                   "object": { "script": "<print 包围盒/体积/关键尺寸的脚本>" } }
+                                   "object": { "readOnly": true,
+                                               "script": "<print 包围盒/体积/关键尺寸的脚本>" } }
 4) 截图       fusion_mcp_read    { "queryType": "screenshot", "direction": "iso-top-left" }
 5) 失败回退   fusion_mcp_update  { "featureType": "undo" }
 ```
@@ -178,3 +223,4 @@ def run(_context: str):
 4. 脚本不写 try/except；失败后用 `fusion_mcp_update` + `undo` 只回退当前这一步。
 5. 除用户明确要求外，不执行 `document: save`；关闭有改动文档前必须先取得用户确认。
 6. MCP 日志不要整段回灌上下文，只保留关键结果行与错误行。
+7. 测量/检查脚本设 `readOnly: true`（命令对话框打开时也可运行）；建模脚本不设，执行前先请用户关闭对话框。非建模类 featureType（`purchase` / `editImage` / `generatePowerpoint` / `previewImage`）不得用于几何校验。
