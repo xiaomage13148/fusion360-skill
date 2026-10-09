@@ -23,11 +23,14 @@
 
 ## 适配器版本与 Schema 核对（重要）
 
-`fusion360-mcp-cad/references/mcp-tools.md` 中记录的是 **MCP Server Adapter 1.0.0** 的实际工具定义（最近核对：2026-09-16，Fusion 360 更新后重新拉取）：
+`fusion360-mcp-cad/references/mcp-tools.md` 中记录的是 **MCP Server Adapter 1.0.0** 的实际工具定义（最近核对：2026-10-09，Fusion 360 更新后重新拉取）：
 
-- 端点：`http://127.0.0.1:27182/mcp`
+- 端点：`http://127.0.0.1:27182/mcp`（协议版本 `2025-03-26`）
 - 工具：`fusion_mcp_read`、`fusion_mcp_execute`、`fusion_mcp_update`、`fusion_mcp_electronics_read`
+- 资源：51 个（`resource://mcp.electronics_entity_types` + 50 个 `resource://mcp.electronics_schema_<snake_case 类名>`）
 - 实体建模统一通过 `fusion_mcp_execute` + `featureType: "script"` 执行 Python 脚本完成
+
+**2026-10-09 核对结果**：工具名称、必填参数与全部枚举无变化；新增 3 个可选 `object` 字段——`userMessageSummary`（所有非建模 featureType 通用）、`title`（`previewImage` 预览标题）、`extensionName`（`purchase` + 扩展）；另补充了 `previewImage` / `purchase` / `editImage` 的行为细节与资源命名规则（已同步至 `references/mcp-tools.md`）。
 
 **适配器升级后，工具名称、参数与枚举值都可能变化。** 升级后请用以下命令拉取最新 schema，与 `references/mcp-tools.md` 逐项核对：
 
@@ -43,11 +46,12 @@ python fusion360-mcp-cad/scripts/check_mcp_server.py --tools --json
 
 1. 工具名称与数量（当前为 4 个）；
 2. `fusion_mcp_read` 的 `queryType` 枚举（当前：`apiDocumentation` / `licensing` / `screenshot` / `document` / `projects` / `activeCommand`）；
-3. `fusion_mcp_execute` 的 `featureType` 枚举（当前：`script` / `document` / `purchase` / `editImage` / `generatePowerpoint` / `previewImage`）与脚本约定（`def run(_context: str):`、`print` 作为输出、不捕获异常、只读脚本用 `readOnly: true`）；
+3. `fusion_mcp_execute` 的 `featureType` 枚举（当前：`script` / `document` / `purchase` / `editImage` / `generatePowerpoint` / `previewImage`）、`object` 子字段清单（当前 16 个，其中 `userMessageSummary` / `title` / `extensionName` 为 2026-10 新增）与脚本约定（`def run(_context: str):`、`print` 作为输出、不捕获异常、只读脚本用 `readOnly: true`）；
 4. `screenshot` 查询的 `direction` 枚举（校验用 `iso-top-left`）与 `width` / `height` 取值范围（32–4096）；
-5. `fusion_mcp_update` 的 `featureType`（`undo` / `redo`）。
+5. `fusion_mcp_update` 的 `featureType`（`undo` / `redo`）；
+6. `fusion_mcp_electronics_read` 的 `entity_type` 枚举（当前 50 个）与 `resources/list` 的 51 个资源项（类 schema 资源名使用 snake_case）。
 
-> 注意：`serverInfo` 版本号可能不变，但工具定义已经扩展（例如 2026-09 的 Fusion 360 更新新增了 `readOnly`、`licensing` 与多个 `featureType`）。**核对时以 schema 内容为准，不要只看版本号。**
+> 注意：`serverInfo` 版本号可能不变，但工具定义会扩展（历史示例：2026-09 新增 `readOnly`、`licensing` 与多个 `featureType`；2026-10 新增 `object.userMessageSummary` 等 3 个可选字段）。**核对时以 schema 内容为准，不要只看版本号。**
 
 发现差异时：同步更新 `fusion360-mcp-cad/references/mcp-tools.md` 及受影响的 `SKILL.md` / references 文件，然后重新打包 zip（保持 `fusion360-mcp-cad/SKILL.md` 的目录结构）。
 

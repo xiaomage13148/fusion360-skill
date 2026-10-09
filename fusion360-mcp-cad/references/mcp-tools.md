@@ -1,8 +1,10 @@
 # Fusion360 MCP 工具参考
 
-> 本文件基于对**实际运行中的 MCP 服务**调用 `tools/list` 返回的真实定义整理（最近核对：2026-09-16，Fusion 360 更新后重新拉取）。
-> 服务信息：`http://127.0.0.1:27182/mcp`，serverInfo = **MCP Server Adapter 1.0.0**。
+> 本文件基于对**实际运行中的 MCP 服务**调用 `tools/list` / `resources/list` 返回的真实定义整理（最近核对：2026-10-09，Fusion 360 更新后重新拉取）。
+> 服务信息：`http://127.0.0.1:27182/mcp`，serverInfo = **MCP Server Adapter 1.0.0**，协议版本 `2025-03-26`。
 > 服务升级后工具与参数可能变化（注意：serverInfo 版本号可能不变但定义已扩展）。用 `scripts/check_mcp_server.py --tools --detail` 查看概览，或用 `--tools --json` 获取完整 schema 后核对本文件。
+>
+> **2026-10-09 核对结论**：4 个工具的名称、必填参数与全部枚举均**无变化**（`queryType`、`featureType`、`direction`、`apiCategory`、`operation`、`undo`/`redo`），electronics 的 50 个 `entity_type` 与 51 个资源无增删。本次变化集中在 `fusion_mcp_execute` 的 `object` 可选字段：新增 `userMessageSummary`、`title`、`extensionName`（详见 §2「其他 featureType」），并补充了 `previewImage` / `purchase` / `editImage` 的行为细节。
 
 ## 服务配置
 
@@ -129,22 +131,24 @@
 | `close` | `userConfirmedSaveAndClose` **或** `userConfirmedCloseWithoutSave` | 有未保存改动时必须先征询用户，二选一 |
 | `save` | 无 | **除用户明确要求保存外，不要调用** |
 
-### 其他 featureType（非建模用途，Fusion 更新后新增）
+### 其他 featureType（非建模用途）
 
 以下能力与本 skill 的实体建模流程无关，仅在用户明确提出对应需求时使用；**不得用于替代几何校验**。
 
-| featureType | 用途 | 必填 object 字段 |
-|---|---|---|
-| `purchase` | 打开应用内 Purchase Manager（订阅、席位、扩展、Flex 令牌） | `purchaseInterest`（`fusion_subscription`/`extension`/`flex`）、`userConfirmedOpenPurchaseManager`（**必须用户明确同意后**才设 true） |
-| `editImage` | 用自然语言提示编辑模型截图（换材质、放入场景渲染） | `image_url`（签名 URL）、`s3_url`、`prompt`（**逐字传递用户提示，不要改写**） |
-| `generatePowerpoint` | 按 JSON 定义生成 PPT | `slides_json`；**调用前必须先读 `resource://mcp.generate_powerpoint_schema` 并向用户确认大纲** |
-| `previewImage` | 预览 / 打开 / 下载生成的文件（图片、pptx） | `image_url`、`s3_url`（单文件传字符串，多文件传等长数组）；`action`：`preview`/`external`/`download` |
+| featureType | 用途 | 必填 object 字段 | 可选 object 字段 |
+|---|---|---|---|
+| `purchase` | 打开应用内 Purchase Manager（订阅、席位、扩展、Flex 令牌） | `purchaseInterest`（`fusion_subscription`/`extension`/`flex`）、`userConfirmedOpenPurchaseManager`（**必须用户明确同意后**才设 true） | `extensionName`（`purchaseInterest: "extension"` 时：扩展 ID 或显示名，优先取 `licensing` 的 `purchasableExtensions` 标题）、`userMessageSummary` |
+| `editImage` | 用自然语言提示编辑模型截图（换材质、放入场景渲染） | `image_url`（签名 URL）、`s3_url`、`prompt`（**逐字传递用户提示，不要改写**） | `userMessageSummary` |
+| `generatePowerpoint` | 按 JSON 定义生成 PPT | `slides_json`；**调用前必须先读 `resource://mcp.generate_powerpoint_schema` 并向用户确认大纲** | `userMessageSummary` |
+| `previewImage` | 预览 / 打开 / 下载生成的文件（图片、pptx） | `image_url`、`s3_url`（单文件传字符串，多文件传等长数组） | `action`：`preview`（默认，仅图片）/`external`/`download`；`title`（`action: "preview"` 时的预览对话框标题）；`userMessageSummary` |
 
 要点：
 
-- `purchase`：调用前先查 `licensing`；不同许可类型（个人 / 教育 / 商业）的可用选项与话术不同，教育用户不得使用 `fusion_subscription` 与 `flex`。
-- `editImage`：每次消耗一次 AI 媒体生成配额；返回结构化 attachments，不要把原始 JSON 展示给用户。
-- `previewImage`：多文件时仅支持 `action: "download"`。
+- `userMessageSummary`（2026-10 核对新增）：所有非建模 featureType 通用的可选字段，携带用户请求的简短转述，仅作上下文提示，不参与执行逻辑；建模流程不需要。
+- `purchase`：调用前先查 `licensing`；不同许可类型（个人 / 教育 / 商业）的可用选项与话术不同，教育用户不得使用 `fusion_subscription` 与 `flex`；Purchase Manager 已打开时该调用是**切换到目标标签页**，不要描述成新开对话框。
+- `editImage`：每次调用消耗一次 AI 媒体生成配额，配额耗尽会返回错误与提示语（原样转达用户）；用户要求重试时必须**重新调用**，不要沿用上次的错误结论；返回结构化 attachments，不要把原始 JSON 展示给用户。
+- `generatePowerpoint`：服务端生成可能需要数分钟；占位符结构为 `{idx, accepts, value}`，`accepts` 取值 `text`/`image`/`any`；图片占位符只能使用 s3:// URL（不要用 thumbnail_url）。注意：当前 adapter 实例**未暴露** `resource://mcp.generate_powerpoint_schema`（见 §4 末注），调用前需确认该资源可读。
+- `previewImage`：多文件（数组）时强制 `action: "download"` 并打包为 ZIP；`preview` 仅支持图片（pptx 自动转 `external`）；`image_url` 过期时服务会用 `s3_url` 自动刷新，两数组长度必须一致。
 - 建模与校验流程中默认不调用以上 4 种。
 
 ## 3. fusion_mcp_update（撤销 / 重做）
@@ -168,7 +172,9 @@
   - `fields`：要返回的列名，省略则返回全部列
   - `filters`：`[{"property": "...", "op": "eq", "value": ...}]`，字符串属性只能用 `eq`；整数/数值属性可用 `lt`/`gt`，但需该属性在 schema 资源中声明支持
   - `pagination`：`{"limit": 100, "offset": 0}`，limit 默认 100、上限 1000；响应中 `hasMore` 为 true 时用 `nextOffset` 取下一页
-- 发现资源：`resource://mcp.electronics_entity_types`（全部类型）、`resource://mcp.electronics_schema_<class>`（该类的属性与过滤操作符）
+- 发现资源：`resource://mcp.electronics_entity_types`（全部类型）、`resource://mcp.electronics_schema_<snake_case 类名>`（该类的属性与过滤操作符）。实测资源名使用 snake_case 转换（如 `electronics.PortNetMappingEntry` → `resource://mcp.electronics_schema_port_net_mapping_entry`），当前共 51 个资源（1 个类型清单 + 50 个类 schema）；`resources/templates/list` 与 `prompts/list` 未实现（返回 `-32601`）。
+- `resources/read` 返回内容为 JSON 字符串：`contents[0].text` 形如 `{"entity_type": "electronics.Wire", "properties": [{"name": "object_id", "type": "integer", "filterable": true, "operators": ["eq"]}, ...]}`——写入 `filters` 前查此资源确认属性可过滤性与支持的运算符。
+- 注意：当前 adapter 实例**未暴露** `resource://mcp.generate_powerpoint_schema`（`resources/list` 不含该项，直接读取返回 `Resource not found`），仅在调用 `generatePowerpoint` 时需留意；与本 skill 的建模流程无关。
 
 ## 典型调用序列
 
