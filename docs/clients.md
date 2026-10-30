@@ -7,7 +7,7 @@
 | 客户端 | Skill 加载 | Fusion MCP | 本仓库验证状态 |
 |---|---|---|---|
 | CodeBuddy | 原仓库安装位置为个人 `~/.codebuddy/skills/` 或项目 `.codebuddy/skills/`，升级时核对客户端当前约定 | 在客户端配置实际服务 | 有历史安装副本；本轮未做完整建模验收 |
-| Codex | 当前官方文档列出项目 `.agents/skills/`；将整个 Skill 目录放入其中，加载后显式选择或用 `$fusion360-mcp-cad` 调用 | 通过当前客户端的 MCP 配置连接服务，CLI 可用 `codex mcp` 管理 | 本轮在当前宿主读取到 Fusion 工具定义，成功查询 UnitsManager 文档；独立 HTTP 诊断也完成初始化与 4 个工具发现。未进行几何修改验收 |
+| Codex | 当前官方文档列出项目 `.agents/skills/`；将整个 Skill 目录放入其中，加载后显式选择或用 `$fusion360-mcp-cad` 调用 | 通过当前客户端的 MCP 配置连接服务，CLI 可用 `codex mcp` 管理 | 已完成手机支架创建、参数修改重建、几何测量和真实截图；详见 [实测记录](phone-stand-test.md)。失败恢复与文件交付尚未验收 |
 | Claude Code | 本轮未取得官方页面内容，按当前产品文档确认 Skill 目录和调用方式 | 按当前客户端文档配置 | 尚未实测，不据此宣称兼容 |
 | Cursor / 其他 MCP 客户端 | 先确认是否支持该 Skill 形式；否则明确让代理读取源码目录的 SKILL.md 和按需参考 | 使用原生 MCP 连接能力 | 尚未实测，不保证自动触发 |
 
@@ -34,6 +34,6 @@ Codex 资料：[Skills](https://developers.openai.com/codex/skills/)、[MCP](htt
 - 修改前失败、部分修改、响应超时与用户介入时不会误撤销或重复创建。
 - 图片链路，以及保存/导出文件的真实格式、路径和单位。
 
-本轮对 UnitsManager 的只读查询确认了 API 内部长度 cm、角度 rad、体积 cm³ 的约定。这不证明执行工具的事务边界，也不证明完整建模、截图和导出链路。
+初始 UnitsManager 查询确认了 API 内部长度 cm、角度 rad、体积 cm³ 的约定。后续 [手机支架实测](phone-stand-test.md) 验证了几何创建、单位、参数重建和图像链路；执行工具事务边界及保存/导出仍需独立验证。
 
 本地 HTTP 实测：`http://127.0.0.1:27182/mcp`，`MCP Server Adapter 1.0.0`，协商协议 `2025-03-26`。发现 4 个工具；此条记录只证明该环境的初始化和发现链路。
