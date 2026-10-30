@@ -1,3 +1,5 @@
+> 历史资料：保留原始构想，不作为当前 Skill 的运行指令。工具名称、执行规则及模型绑定可能过时；当前入口见 [SKILL.md](../fusion360-mcp-cad/SKILL.md)。
+
 # Fusion360 MCP \+ DeepSeek V4\.1 Flash 多模态CAD建模规则封装成 Skill
 
 # 方案：把 Fusion360 MCP \+ DeepSeek V4\.1 Flash 多模态 CAD 建模规则封装成 Skill

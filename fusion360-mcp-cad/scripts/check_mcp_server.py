@@ -1,274 +1,246 @@
 #!/usr/bin/env python3
-"""Probe a Fusion360 MCP server endpoint (Streamable HTTP / JSON-RPC 2.0).
+"""Optional Streamable HTTP diagnostic, not a modeling prerequisite.
 
-Run this before starting a modeling session to confirm the MCP server is
-online, and optionally list the tools it exposes.
-
-Examples:
-    python check_mcp_server.py                      # probe default endpoint /mcp
-    python check_mcp_server.py --tools --detail     # list tools with params
-    python check_mcp_server.py --tools --json       # full tool schemas as JSON
-    python check_mcp_server.py --endpoint http://127.0.0.1:27182/mcp
-
-Exit codes:
-    0 - server reachable and responded to MCP initialize
-    1 - server unreachable or protocol handshake failed
+Python 3.10+, standard library only. POST JSON or SSE responses; tools/list
+pagination. No stdio, legacy two-endpoint SSE, OAuth, or server-initiated RPC.
+Exit 0: requested initialization/discovery succeeded; 1: request failed;
+2: invalid CLI configuration. This does not certify modeling capabilities.
 """
-
 import argparse
 import json
+import math
+import os
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-DEFAULT_ENDPOINT = "http://127.0.0.1:27182"
-# The Fusion360 MCP adapter serves MCP on /mcp; other paths are fallbacks.
-# If --endpoint already ends with /mcp, no extra path is appended.
-DEFAULT_PATHS = ["/mcp", "", "/mcp/"]
+DEFAULT_ENDPOINT = "http://127.0.0.1:27182/mcp"
 PROTOCOL_VERSION = "2025-03-26"
-CLIENT_INFO = {"name": "fusion360-mcp-cad-skill-checker", "version": "1.0.0"}
+SUPPORTED_VERSIONS = {"2025-03-26", "2025-06-18", "2025-11-25"}
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-
-def _post(url, payload, session_id=None, timeout=5.0):
-    """POST a JSON-RPC payload, return (status, headers_dict, body_text)."""
-    data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8", errors="replace")
-        return response.status, {k.lower(): v for k, v in response.headers.items()}, body
+class ProtocolError(Exception):
+    pass
 
 
 def _parse_messages(content_type, body):
-    """Extract JSON-RPC messages from a plain JSON or SSE response body."""
-    messages = []
-    if not body or not body.strip():
-        return messages
-    if "text/event-stream" in (content_type or ""):
-        for line in body.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                chunk = line[5:].strip()
-                try:
-                    messages.append(json.loads(chunk))
-                except json.JSONDecodeError:
-                    continue
-    else:
-        try:
-            messages.append(json.loads(body))
-        except json.JSONDecodeError:
-            return messages
+    """Parse complete JSON or SSE events; multi-line data belongs to one event."""
+    if "text/event-stream" not in content_type.lower():
+        return [json.loads(body)] if body.strip() else []
+    messages, data = [], []
+    for line in body.splitlines() + [""]:
+        if not line:
+            if data:
+                messages.append(json.loads("\n".join(data)))
+                data = []
+        elif line.startswith("data:"):
+            value = line[5:]
+            data.append(value[1:] if value.startswith(" ") else value)
     return messages
 
 
-def _initialize_payload(request_id=1):
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": CLIENT_INFO,
-        },
-    }
+def _result(message, request_id):
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or message.get("id") != request_id:
+        raise ProtocolError("invalid or mismatched JSON-RPC response")
+    if "error" in message:
+        error = message["error"]
+        if isinstance(error, dict):
+            raise ProtocolError("JSON-RPC %s: %s" % (error.get("code"), error.get("message")))
+        raise ProtocolError("malformed JSON-RPC error")
+    if not isinstance(message.get("result"), dict):
+        raise ProtocolError("missing object result in JSON-RPC response")
+    return message["result"]
 
 
-def probe(endpoint, path, timeout):
-    """Attempt an MCP initialize handshake on one candidate path."""
-    url = endpoint.rstrip("/") + path
-    result = {"url": url, "status": None, "ok": False, "session": None, "server": None, "detail": ""}
-    try:
-        status, headers, body = _post(url, _initialize_payload(), timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        body = ""
+class Client:
+    def __init__(self, url, timeout=5.0, token=None):
+        self.url, self.timeout, self.token = url, timeout, token
+        self.session, self.version = None, None
+        self.next_id = 0
+
+    def post(self, method, params=None, notification=False):
+        self.next_id += 1
+        request_id = self.next_id
+        payload = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        if not notification:
+            payload["id"] = request_id
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        if self.session:
+            headers["Mcp-Session-Id"] = self.session
+        if self.version:
+            headers["MCP-Protocol-Version"] = self.version
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(self.url, json.dumps(payload).encode("utf-8"), headers, method="POST")
+        deadline = time.monotonic() + self.timeout
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        result["status"] = exc.code
-        result["detail"] = "HTTP {} from {}; body: {}".format(
-            exc.code, url, body[:300] if body else "<empty>"
-        )
-        return result
-    except urllib.error.URLError as exc:
-        result["detail"] = "connection failed: {}".format(exc.reason)
-        return result
-    except Exception as exc:  # socket timeout, malformed URL, etc.
-        result["detail"] = "{}: {}".format(type(exc).__name__, exc)
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                if method == "initialize":
+                    self.session = response.headers.get("Mcp-Session-Id")
+                if notification:
+                    if response.status != 202:
+                        raise ProtocolError("notification expected HTTP 202, got %s" % response.status)
+                    return None
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "text/event-stream" in content_type:
+                    data, total = [], 0
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("SSE response deadline exceeded")
+                        # urllib has no public setter for the remaining read budget.
+                        # HTTPResponse uses this socket on CPython; initial socket
+                        # timeout remains a bounded fallback on other runtimes.
+                        sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                        if sock is not None:
+                            sock.settimeout(remaining)
+                        line = response.readline(MAX_RESPONSE_BYTES - total + 1)
+                        total += len(line)
+                        if total > MAX_RESPONSE_BYTES:
+                            raise ProtocolError("response exceeds 8 MiB limit")
+                        if not line:
+                            raise ProtocolError("SSE ended before matching response")
+                        line = line.decode("utf-8").rstrip("\r\n")
+                        if line.startswith("data:"):
+                            value = line[5:]
+                            data.append(value[1:] if value.startswith(" ") else value)
+                        elif not line and data:
+                            message = json.loads("\n".join(data))
+                            data = []
+                            if not isinstance(message, dict):
+                                raise ProtocolError("SSE event must contain a JSON-RPC object")
+                            if "method" in message and "id" in message:
+                                raise ProtocolError("server-initiated RPC is unsupported by this diagnostic")
+                            if message.get("id") == request_id:
+                                return _result(message, request_id)
+                if "application/json" not in content_type:
+                    raise ProtocolError("expected application/json or text/event-stream")
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise ProtocolError("response exceeds 8 MiB limit")
+                return _result(json.loads(body), request_id)
+        except urllib.error.HTTPError as exc:
+            # Do not echo response bodies, request headers or session identifiers.
+            raise ProtocolError("HTTP %s" % exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise ProtocolError("connection failed: %s" % exc.reason) from exc
+        except (ValueError, UnicodeError) as exc:
+            raise ProtocolError("invalid JSON/UTF-8 response") from exc
+
+    def initialize(self):
+        result = self.post("initialize", {
+            "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": {"name": "fusion360-skill-checker", "version": "2.0.0"}})
+        version = result.get("protocolVersion")
+        if not isinstance(version, str) or version not in SUPPORTED_VERSIONS:
+            raise ProtocolError("unsupported negotiated protocol version: %r" % version)
+        if not isinstance(result.get("serverInfo"), dict) or not isinstance(result.get("capabilities"), dict):
+            raise ProtocolError("initialize missing serverInfo or capabilities object")
+        self.version = version
+        self.post("notifications/initialized", notification=True)
         return result
 
-    result["status"] = status
-    result["session"] = headers.get("mcp-session-id")
-    messages = _parse_messages(headers.get("content-type", ""), body)
-    for message in messages:
-        if isinstance(message, dict) and message.get("id") == 1:
-            if "result" in message:
-                result["ok"] = True
-                info = message.get("result", {}).get("serverInfo", {}) or {}
-                result["server"] = "{} {}".format(info.get("name", "?"), info.get("version", "")).strip()
-                result["detail"] = "initialize OK"
-                return result
-            if "error" in message:
-                result["detail"] = "JSON-RPC error: {}".format(json.dumps(message["error"])[:300])
-                return result
-    result["detail"] = "no JSON-RPC initialize response; body: {}".format(body[:300] if body else "<empty>")
-    return result
+    def list_tools(self):
+        tools, cursors, cursor = [], set(), None
+        for _ in range(100):
+            result = self.post("tools/list", {"cursor": cursor} if cursor is not None else {})
+            page = result.get("tools")
+            if not isinstance(page, list):
+                raise ProtocolError("tools/list missing tools array")
+            for tool in page:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not isinstance(tool.get("inputSchema"), dict):
+                    raise ProtocolError("malformed tool definition")
+            tools.extend(page)
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return tools
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise ProtocolError("invalid or repeated tools/list cursor")
+            cursors.add(cursor)
+        raise ProtocolError("tools/list exceeded 100-page limit")
 
 
-def list_tools(endpoint, path, session_id, timeout):
-    """Request tools/list after a successful handshake."""
-    url = endpoint.rstrip("/") + path
+def check(endpoint, timeout=5.0, include_tools=False, token=None):
+    client = Client(endpoint, timeout, token)
+    report = {"endpoint_url": endpoint, "initialized": False, "protocol_version": None,
+              "server": None, "tools_discovered": None, "tools": [], "error": "",
+              "scope": "initialization-and-discovery-only"}
     try:
-        _post(
-            url,
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {},
-            },
-            session_id=session_id,
-            timeout=timeout,
-        )
-    except Exception:
-        pass
-
-    try:
-        _, headers, body = _post(
-            url,
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            session_id=session_id,
-            timeout=timeout,
-        )
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = ""
-        return [], "HTTP {}: {}".format(exc.code, body[:200])
-    except Exception as exc:
-        return [], "{}: {}".format(type(exc).__name__, exc)
-
-    for message in _parse_messages(headers.get("content-type", ""), body):
-        if isinstance(message, dict) and message.get("id") == 2:
-            tools = message.get("result", {}).get("tools", [])
-            return [tool for tool in tools if isinstance(tool, dict)], ""
-    return [], "no tools/list response; body: {}".format(body[:200] if body else "<empty>")
+        init = client.initialize()
+        report.update(initialized=True, protocol_version=client.version, server=init["serverInfo"])
+        if include_tools:
+            report["tools_discovered"] = False
+            if "tools" not in init["capabilities"]:
+                raise ProtocolError("server does not advertise tools capability")
+            report["tools"] = client.list_tools()
+            report["tools_discovered"] = True
+    except (ProtocolError, OSError, ValueError, RecursionError) as exc:
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+        for secret in (client.session, token):
+            if secret:
+                report["error"] = report["error"].replace(secret, "[redacted]")
+    report["ok"] = report["initialized"] and (not include_tools or report["tools_discovered"] is True) and not report["error"]
+    return report
 
 
 def param_summary(tool):
-    """Return 'name:type' entries ('*' marks required) from a tool inputSchema."""
     schema = tool.get("inputSchema") or {}
+    required = schema.get("required") or []
     properties = schema.get("properties") or {}
-    required = set(schema.get("required") or [])
-    entries = []
-    for name, spec in properties.items():
-        kind = ""
-        if isinstance(spec, dict):
-            kind = spec.get("type", "")
-            if isinstance(kind, list):
-                kind = "/".join(str(item) for item in kind)
-        marker = "*" if name in required else ""
-        entries.append("{}{}{}".format(name, marker, ":{}".format(kind) if kind else ""))
-    return entries
+    if not isinstance(properties, dict):
+        return []
+    return ["%s%s" % (key, "*" if key in required else "") for key in properties]
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Probe a Fusion360 MCP server endpoint and optionally list its tools."
-    )
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="base URL, default %s" % DEFAULT_ENDPOINT)
-    parser.add_argument("--path", default=None, help="MCP path; default tries '', '/mcp', '/mcp/'")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="exact MCP URL; a bare origin uses /mcp")
+    parser.add_argument("--path", help="explicit path overriding endpoint path")
     parser.add_argument("--timeout", type=float, default=5.0, help="per-request timeout in seconds")
-    parser.add_argument("--tools", action="store_true", help="list tools after a successful handshake")
-    parser.add_argument("--detail", action="store_true", help="with --tools, also print each tool description and params")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON (includes full tool schemas)")
-    args = parser.parse_args()
-
-    endpoint = args.endpoint.rstrip("/")
-    if args.path:
-        candidates = [args.path]
-    elif endpoint.endswith("/mcp"):
-        candidates = [""]  # endpoint already points at the MCP path
-    else:
-        candidates = DEFAULT_PATHS
-    report = {
-        "endpoint": args.endpoint,
-        "reachable": False,
-        "endpoint_url": None,
-        "server": None,
-        "session": None,
-        "tools": [],
-        "attempts": [],
-        "tools_error": "",
-    }
-
-    successful_path = ""
-    for path in candidates:
-        attempt = probe(endpoint, path, args.timeout)
-        report["attempts"].append(attempt)
-        if attempt["ok"]:
-            report["reachable"] = True
-            report["endpoint_url"] = attempt["url"]
-            report["server"] = attempt["server"]
-            report["session"] = attempt["session"]
-            successful_path = path
-            break
-        # A transport-level failure (no HTTP status) affects every path on the
-        # same host:port, so stop early instead of waiting for more timeouts.
-        if attempt["status"] is None:
-            break
-
-    if report["reachable"] and args.tools:
-        # Reuse the path that answered the handshake instead of assuming one.
-        tools, error = list_tools(endpoint, successful_path, report["session"], args.timeout)
-        report["tools"] = tools
-        report["tools_error"] = error
-
+    parser.add_argument("--tools", action="store_true", help="require successful discovery of all tool pages")
+    parser.add_argument("--detail", action="store_true", help="with --tools, show tool descriptions and parameter names")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable report")
+    parser.add_argument("--token-env", help="optional environment variable containing a bearer token; never printed")
+    args = parser.parse_args(argv)
+    try:
+        parsed = urllib.parse.urlsplit(args.endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("endpoint must be an http(s) URL without credentials, query or fragment")
+        _ = parsed.port
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        if args.path and (not args.path.startswith("/") or "?" in args.path or "#" in args.path):
+            raise ValueError("path must start with / and contain no query or fragment")
+        endpoint = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, args.path or parsed.path or "/mcp", "", ""))
+        token = os.environ.get(args.token_env) if args.token_env else None
+        if args.token_env and not token:
+            raise ValueError("token environment variable is unset or empty")
+    except ValueError as exc:
+        parser.error(str(exc))
+    report = check(endpoint, args.timeout, args.tools, token)
     if args.json:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("Fusion360 MCP server check")
-        print("  endpoint : %s" % args.endpoint)
-        if report["reachable"]:
-            print("  status   : ONLINE")
-            print("  url      : %s" % report["endpoint_url"])
-            if report["server"]:
-                print("  server   : %s" % report["server"])
-            if args.tools:
-                if report["tools"]:
-                    print("  tools    : %d available" % len(report["tools"]))
-                    for tool in report["tools"]:
-                        print("             - %s" % tool.get("name", "?"))
-                        if args.detail:
-                            description = " ".join((tool.get("description") or "").split())
-                            if description:
-                                print("               %s" % description[:240])
-                            params = param_summary(tool)
-                            print("               params: %s" % (", ".join(params) if params else "<none>"))
-                else:
-                    print("  tools    : unavailable (%s)" % (report["tools_error"] or "unknown reason"))
-        else:
-            print("  status   : OFFLINE / handshake failed")
-            for attempt in report["attempts"]:
-                print("  attempt  : %s" % attempt["url"])
-                print("             %s" % attempt["detail"])
-            print("  hint     : start Fusion 360, load the MCP add-in, then confirm the endpoint/port.")
-
-    sys.exit(0 if report["reachable"] else 1)
+        print("Fusion MCP diagnostic: %s" % ("PASS" if report["ok"] else "FAIL"))
+        print("  endpoint: %s" % endpoint)
+        print("  initialized: %s; tools discovered: %s" % (report["initialized"], report["tools_discovered"]))
+        if report["error"]:
+            print("  error: %s" % report["error"])
+        for tool in report["tools"]:
+            print("  - %s" % tool["name"])
+            if args.detail:
+                print("    %s" % " ".join(str(tool.get("description", "")).split())[:240])
+                print("    params: %s" % ", ".join(param_summary(tool)))
+        print("  scope: connection/initialization/discovery; CAD operations are not verified")
+    return 0 if report["ok"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    raise SystemExit(main())

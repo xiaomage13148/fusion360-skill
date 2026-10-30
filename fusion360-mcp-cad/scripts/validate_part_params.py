@@ -1,228 +1,227 @@
 #!/usr/bin/env python3
-"""Validate a part parameter JSON before driving Fusion360 MCP modeling.
+"""Offline parameter validation, not CAD geometry or manufacturing certification.
 
-Checks:
-  1. Structure   - part name, units, non-empty ordered feature list, positive numeric params.
-  2. Manufacture - static printability heuristics (wall thickness, hole size,
-                   fillet radius, draft angle, deep-cavity hints).
-
-Parameter JSON template:
-
-    {
-      "part_name": "bracket",
-      "units": "mm",
-      "process": "FDM",
-      "features": [
-        {"step": 1, "type": "extrude",
-         "params": {"width_mm": 40, "height_mm": 20, "depth_mm": 5}},
-        {"step": 2, "type": "hole",
-         "params": {"hole_dia_mm": 3.2, "count": 2, "wall_mm": 1.6}}
-      ]
-    }
-
-Usage:
-    python validate_part_params.py params.json
-    python validate_part_params.py -            # read from stdin
-    python validate_part_params.py params.json --process FDM --json
-
-Exit codes:
-    0 - no errors (warnings allowed)
-    1 - one or more errors
+Python 3.10+, standard library only. See references/parameter-format.md.
+Exit 0: no errors (warnings allowed); exit 1: invalid input or I/O error.
 """
-
 import argparse
 import json
+import math
 import re
 import sys
+from pathlib import Path
 
-WALL_HINTS = ("wall", "thickness", "shell")
-HOLE_HINTS = ("hole", "dia", "diam", "bore", "drill")
-RADIUS_HINTS = ("fillet", "radius", "chamfer")
-DRAFT_HINTS = ("draft", "taper")
-DEPTH_HINTS = ("depth", "height", "thickness", "wall")
-
-MIN_WALL_MM = {"FDM": 1.2, "SLA": 0.8, "SLS": 0.8}
-MIN_HOLE_MM = 1.0
-MIN_FILLET_MM = 0.5
-MIN_DRAFT_DEG = 1.0
-DEEP_CAVITY_MM = 20.0
+LENGTH_UNITS = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4}
+ALIASES = {"millimeter": "mm", "millimetre": "mm", "inch": "in"}
+KINDS = {"length", "diameter", "wall", "radius", "count", "angle", "offset",
+         "coordinate", "clearance", "scalar"}
+POSITIVE = {"length", "diameter", "wall", "radius"}
+FEATURES = {"sketch", "extrude", "hole", "cut", "revolve", "pattern", "fillet",
+            "chamfer", "shell", "sweep", "loft", "combine", "offset", "parameter"}
+WALL_START_MM = {"FDM": 1.2, "SLA": 0.8, "DLP": 0.8}
 
 
-if hasattr(sys.stdout, "reconfigure"):
+def unit_name(value):
+    return ALIASES.get(value.strip().lower(), value.strip().lower()) if isinstance(value, str) else None
+
+
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
-def _matches(key, hints):
-    lowered = key.lower()
-    return any(hint in lowered for hint in hints)
+def infer_parameter(key):
+    """Conservative legacy shorthand; tokens, not arbitrary substring matches."""
+    parts = key.lower().split("_")
+    suffix = parts[-1]
+    unit = suffix if suffix in {*LENGTH_UNITS, "deg", "rad"} else None
+    tokens = set(parts[:-1] if unit else parts)
+    if "count" in tokens:
+        return "count", unit
+    if tokens & {"angle", "draft", "taper"} or unit in {"deg", "rad"}:
+        return "angle", unit
+    if tokens & {"x", "y", "z", "coordinate", "position", "center"}:
+        return "coordinate", unit
+    if "offset" in tokens:
+        return "offset", unit
+    if tokens & {"clearance", "gap"}:
+        return "clearance", unit
+    if tokens & {"dia", "diam", "diameter", "bore"}:
+        return "diameter", unit
+    if tokens & {"wall", "thickness"}:
+        return "wall", unit
+    if tokens & {"radius", "fillet", "chamfer"}:
+        return "radius", unit
+    if unit in LENGTH_UNITS or tokens & {"width", "height", "depth", "length", "pitch", "distance"}:
+        return "length", unit
+    return None, unit
 
 
-def _numeric_items(params):
-    """Yield (key, value) for finite numeric parameter values."""
-    for key, value in params.items():
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)):
-            yield key, float(value)
-
-
-def validate(data, process):
+def validate(data, process=None):
+    """Return (errors, warnings, infos, part_name, process); never mutates input."""
     errors, warnings, infos = [], [], []
-
     if not isinstance(data, dict):
-        return ["top-level JSON must be an object"], [], [], None, (process or "FDM").upper()
-
-    # ---- structure -------------------------------------------------------
-    part_name = data.get("part_name") or data.get("name")
-    if not isinstance(part_name, str) or not part_name.strip():
-        errors.append("missing or empty 'part_name'")
+        return ["top-level JSON must be an object"], [], [], None, None
+    name = data.get("part_name", data.get("name"))
+    if not isinstance(name, str) or not name.strip():
+        errors.append("'part_name' must be a non-empty string")
+        name = None
     else:
-        part_name = part_name.strip()
-
-    units = str(data.get("units", "")).strip().lower()
-    if units not in ("mm", "millimeter", "millimetre"):
-        if units in ("cm", "m", "in", "inch"):
-            errors.append("units '%s' is not mm; convert all values to mm before modeling" % units)
+        name = name.strip()
+    if "schema_version" in data and (type(data["schema_version"]) is not int or data["schema_version"] != 1):
+        errors.append("only integer schema_version 1 is supported")
+    units = unit_name(data.get("units"))
+    if units not in LENGTH_UNITS:
+        errors.append("'units' must be mm, cm, m or in")
+    selected = process if process is not None else data.get("process")
+    if selected is not None:
+        if not isinstance(selected, str) or not selected.strip():
+            errors.append("'process' must be a non-empty string or null")
+            selected = None
         else:
-            errors.append("'units' must be 'mm' (got %r)" % data.get("units"))
-
-    process = (process or data.get("process") or "FDM").upper()
-    if process not in MIN_WALL_MM:
-        infos.append("unknown process '%s'; FDM wall limit applied" % process)
-        process = "FDM"
-
+            selected = selected.strip().upper()
+    if selected and selected not in WALL_START_MM:
+        warnings.append("process '%s' has no built-in manufacturing checks; generic checks only" % selected)
+    unknown = set(data) - {"schema_version", "part_name", "name", "units", "process", "features"}
+    for key in sorted(unknown):
+        warnings.append("top-level field '%s' preserved but not validated" % key)
     features = data.get("features")
     if not isinstance(features, list) or not features:
         errors.append("'features' must be a non-empty array")
         features = []
-
-    seen_steps = set()
-    for index, feature in enumerate(features, start=1):
+    previous = set()
+    for index, feature in enumerate(features, 1):
         label = "features[%d]" % (index - 1)
         if not isinstance(feature, dict):
-            errors.append("%s must be an object" % label)
+            errors.append(label + " must be an object")
             continue
-
         step = feature.get("step")
-        if not isinstance(step, int) or step < 1:
-            errors.append("%s: 'step' must be a positive integer" % label)
-        elif step in seen_steps:
-            errors.append("%s: duplicate step %d" % (label, step))
+        if type(step) is not int or step != index:
+            errors.append(label + ": step must equal array position %d (ordered 1..N)" % index)
+        kind = feature.get("type")
+        if not isinstance(kind, str) or not kind.strip():
+            errors.append(label + ": type must be a non-empty string")
+        elif kind not in FEATURES:
+            warnings.append(label + ": feature type '%s' not covered by built-in checks" % kind)
+        deps = feature.get("depends_on", [])
+        if not isinstance(deps, list):
+            errors.append(label + ": depends_on must be an array of prior step numbers")
         else:
-            seen_steps.add(step)
-
-        feature_type = feature.get("type")
-        if not isinstance(feature_type, str) or not feature_type.strip():
-            errors.append("%s: 'type' must be a non-empty string (e.g. sketch/extrude/hole)" % label)
-
-        params = feature.get("params", {})
+            for dep in deps:
+                if type(dep) is not int or dep not in previous:
+                    errors.append(label + ": dependency must refer to an earlier valid step")
+        if type(step) is int and step == index:
+            previous.add(step)
+        for key in sorted(set(feature) - {"step", "type", "params", "depends_on"}):
+            warnings.append(label + ": field '%s' preserved but not validated" % key)
+        params = feature.get("params")
         if not isinstance(params, dict) or not params:
-            errors.append("%s: 'params' must be a non-empty object" % label)
+            errors.append(label + ": params must be a non-empty object")
             continue
-
-        for key, value in _numeric_items(params):
-            name = key.lower()
-            if value != value or value in (float("inf"), float("-inf")):
-                errors.append("%s: '%s' is not a finite number" % (label, key))
+        for key, raw in params.items():
+            if not isinstance(key, str) or not key.strip():
+                errors.append(label + ": parameter name must be a non-empty string")
                 continue
-
-            if _matches(name, DRAFT_HINTS):
-                if value != 0 and abs(value) < MIN_DRAFT_DEG:
-                    warnings.append("%s: draft '%s' = %g deg is below %g deg; release may bind"
-                                    % (label, key, value, MIN_DRAFT_DEG))
+            field = label + ".params." + key
+            inferred, suffix = infer_parameter(key)
+            if isinstance(raw, dict) and "kind" in raw:
+                pkind, value = raw.get("kind"), raw.get("value")
+                if not isinstance(pkind, str) or pkind not in KINDS:
+                    errors.append(field + ": unsupported parameter kind")
+                    continue
+                if inferred and inferred != pkind:
+                    errors.append(field + ": declared kind conflicts with recognized parameter name")
+                    continue
+                punit = unit_name(raw.get("unit")) if "unit" in raw else None
+                if "unit" in raw and not punit:
+                    errors.append(field + ": unit must be a non-empty string")
+                    continue
+                if suffix and punit and suffix != punit:
+                    errors.append(field + ": unit conflicts with name suffix")
+                    continue
+                punit = punit or suffix
+                for extra in sorted(set(raw) - {"kind", "value", "unit"}):
+                    warnings.append(field + ": field '%s' preserved but not validated" % extra)
+            else:
+                pkind, value, punit = inferred, raw, suffix
+            if pkind is None:
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and not finite_number(value):
+                    errors.append(field + ": number must be finite")
+                else:
+                    warnings.append(field + ": unrecognized parameter preserved but not validated; declare kind/value")
                 continue
-
-            if _matches(name, HOLE_HINTS):
-                if value < MIN_HOLE_MM:
-                    warnings.append("%s: hole '%s' = %g mm is below printable minimum %g mm"
-                                    % (label, key, value, MIN_HOLE_MM))
+            if not finite_number(value):
+                errors.append(field + ": expected a finite number, not a boolean, string or object")
                 continue
-
-            if _matches(name, RADIUS_HINTS):
-                if value < MIN_FILLET_MM:
-                    infos.append("%s: radius '%s' = %g mm is very small; expect fillet failure"
-                                 % (label, key, value))
+            if pkind == "count":
+                if type(value) is not int or value < 1 or punit is not None:
+                    errors.append(field + ": count must be a positive integer without units")
                 continue
-
-            if _matches(name, WALL_HINTS):
-                limit = MIN_WALL_MM[process]
-                if value < limit:
-                    warnings.append("%s: wall '%s' = %g mm is below %s minimum %g mm"
-                                    % (label, key, value, process, limit))
+            if pkind == "scalar":
+                if punit is not None:
+                    errors.append(field + ": scalar must not have a unit")
                 continue
+            if pkind == "angle":
+                if punit not in {"deg", "rad"}:
+                    errors.append(field + ": angle requires explicit deg or rad unit")
+                continue
+            punit = punit or units
+            if punit not in LENGTH_UNITS:
+                errors.append(field + ": length quantity needs mm, cm, m or in")
+                continue
+            if pkind in POSITIVE and value <= 0:
+                errors.append(field + ": %s must be greater than zero" % pkind)
+                continue
+            if pkind == "clearance" and value < 0:
+                errors.append(field + ": clearance must be non-negative; model interference explicitly")
+                continue
+            try:
+                mm = value * LENGTH_UNITS[punit]
+            except OverflowError:
+                mm = float("inf")
+            if not math.isfinite(mm):
+                errors.append(field + ": converted length is not finite")
+                continue
+            if selected in WALL_START_MM:
+                if pkind == "wall" and mm < WALL_START_MM[selected]:
+                    warnings.append(field + ": %g mm below %s wall starting point %g mm; process calibration required"
+                                    % (mm, selected, WALL_START_MM[selected]))
+                if pkind == "diameter" and mm < 1.0:
+                    warnings.append(field + ": small printable hole; verify process capability and compensation")
+    infos.append("Static parameter checks only; geometry, fit, global wall thickness and manufacturing are not verified")
+    return errors, warnings, infos, name, selected
 
-            # depth/height style dimensions: only sanity-check the sign
-            if value <= 0:
-                warnings.append("%s: dimension '%s' = %g is not positive; verify direction handling"
-                                % (label, key, value))
 
-        # deep cavity hint: depth-like value far exceeding wall-like value
-        depth_like = [v for k, v in _numeric_items(params) if _matches(k.lower(), DEPTH_HINTS)]
-        if depth_like and max(depth_like) > DEEP_CAVITY_MM and not any(
-            _matches(k.lower(), DRAFT_HINTS) for k in params
-        ):
-            infos.append("%s: feature deeper than %g mm without a draft angle; consider 1-3 deg draft"
-                         % (label, DEEP_CAVITY_MM))
-
-    if features and seen_steps:
-        expected = list(range(1, len(features) + 1))
-        if sorted(seen_steps) != expected:
-            warnings.append("steps %s are not a contiguous 1..%d sequence; execution order may be ambiguous"
-                            % (sorted(seen_steps), len(features)))
-
-    return errors, warnings, infos, part_name, process
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Validate part parameter JSON for Fusion360 MCP modeling.")
-    parser.add_argument("source", help="path to the JSON file, or '-' to read from stdin")
-    parser.add_argument("--process", default=None, help="printing process: FDM / SLA / SLS (default FDM or JSON field)")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON report")
-    args = parser.parse_args()
-
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", help="JSON path or '-' for stdin")
+    parser.add_argument("--process", help="optional manufacturing process override; no default process")
+    parser.add_argument("--json", action="store_true", help="emit a JSON report, including on input errors")
+    args = parser.parse_args(argv)
     try:
-        if args.source == "-":
-            raw = sys.stdin.read().lstrip("\ufeff")
-        else:
-            # utf-8-sig tolerates a BOM written by Notepad / PowerShell
-            with open(args.source, "r", encoding="utf-8-sig") as handle:
-                raw = handle.read()
+        raw = sys.stdin.read().lstrip("\ufeff") if args.source == "-" else Path(args.source).read_text(encoding="utf-8-sig")
         data = json.loads(raw)
-    except FileNotFoundError:
-        print("ERROR: file not found: %s" % args.source)
-        sys.exit(1)
-    except json.JSONDecodeError as exc:
-        print("ERROR: invalid JSON - %s" % exc)
-        sys.exit(1)
-
-    errors, warnings, infos, part_name, process = validate(data, args.process)
-    verdict = "FAIL" if errors else ("PASS WITH WARNINGS" if warnings else "PASS")
-
-    report = {
-        "part_name": part_name,
-        "process": process,
-        "verdict": verdict,
-        "errors": errors,
-        "warnings": warnings,
-        "infos": infos,
-    }
-
+        errors, warnings, infos, name, process = validate(data, args.process)
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        errors, warnings, infos, name, process = ["input error: %s" % exc], [], [], None, None
+    report = {"part_name": name, "process": process,
+              "verdict": "FAIL" if errors else ("PASS WITH WARNINGS" if warnings else "PASS"),
+              "scope": "static-parameters-only", "errors": errors, "warnings": warnings, "infos": infos}
     if args.json:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("Part parameter validation")
-        print("  part    : %s" % (part_name or "<unnamed>"))
-        print("  process : %s" % process)
-        for label, items in (("ERROR", errors), ("WARN", warnings), ("INFO", infos)):
-            for item in items:
-                print("  %-5s : %s" % (label, item))
-        print("  verdict : %s" % verdict)
-
-    sys.exit(1 if errors else 0)
+        print("Part: %s; process: %s; %s" % (name, process or "unspecified", report["verdict"]))
+        for label, messages in (("ERROR", errors), ("WARN", warnings), ("INFO", infos)):
+            for message in messages:
+                print("%s: %s" % (label, message))
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    raise SystemExit(main())
